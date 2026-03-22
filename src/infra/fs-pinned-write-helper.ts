@@ -104,11 +104,14 @@ const LOCAL_PINNED_WRITE_PYTHON = [
 const PINNED_WRITE_PYTHON_CANDIDATES = [
   process.env.OPENCLAW_PINNED_WRITE_PYTHON,
   "/usr/bin/python3",
-  "/opt/homebrew/bin/python3",
   "/usr/local/bin/python3",
+  "/opt/homebrew/bin/python3",
+  "/opt/local/bin/python3",
+  process.env.HOME ? `${process.env.HOME}/.pyenv/shims/python3` : null,
 ].filter((value): value is string => Boolean(value));
 
 let cachedPinnedWritePython = "";
+let cachedPinnedWritePythonError: string | null = null;
 
 function canExecute(binPath: string): boolean {
   try {
@@ -119,17 +122,52 @@ function canExecute(binPath: string): boolean {
   }
 }
 
+/**
+ * Resolve python3 interpreter path with comprehensive fallback strategy.
+ * 
+ * Strategy:
+ * 1. Check environment variable OPENCLAW_PINNED_WRITE_PYTHON
+ * 2. Try common installation paths
+ * 3. Try pyenv shim if available
+ * 4. Search PATH using which command
+ * 5. Fall back to 'python3' (may fail if not in PATH)
+ * 
+ * @throws Error if python3 cannot be found and cached error is set
+ */
 function resolvePinnedWritePython(): string {
   if (cachedPinnedWritePython) {
     return cachedPinnedWritePython;
   }
+  
+  // Try configured and common paths first
   for (const candidate of PINNED_WRITE_PYTHON_CANDIDATES) {
     if (canExecute(candidate)) {
       cachedPinnedWritePython = candidate;
+      cachedPinnedWritePythonError = null;
       return cachedPinnedWritePython;
     }
   }
+  
+  // Try to find python3 in PATH using which command
+  try {
+    const { execSync } = require("node:child_process");
+    const pythonPath = execSync("which python3", { encoding: "utf8" }).trim();
+    if (pythonPath && canExecute(pythonPath)) {
+      cachedPinnedWritePython = pythonPath;
+      cachedPinnedWritePythonError = null;
+      return cachedPinnedWritePython;
+    }
+  } catch {
+    // which command failed, continue to fallback
+  }
+  
+  // Final fallback: use 'python3' but cache the error for better error messages
   cachedPinnedWritePython = "python3";
+  cachedPinnedWritePythonError = 
+    "python3 interpreter not found in common paths or PATH. " +
+    "Please install Python 3 and ensure it's available in your PATH. " +
+    "You can also set OPENCLAW_PINNED_WRITE_PYTHON environment variable to specify the path.";
+  
   return cachedPinnedWritePython;
 }
 
@@ -160,21 +198,29 @@ export async function runPinnedWriteHelper(params: {
   mode: number;
   input: PinnedWriteInput;
 }): Promise<FileIdentityStat> {
-  const child = spawn(
-    resolvePinnedWritePython(),
-    [
-      "-c",
-      LOCAL_PINNED_WRITE_PYTHON,
-      params.rootPath,
-      params.relativeParentPath,
-      params.basename,
-      params.mkdir ? "1" : "0",
-      (params.mode || 0o600).toString(8),
-    ],
-    {
-      stdio: ["pipe", "pipe", "pipe"],
-    },
-  );
+  const pythonPath = resolvePinnedWritePython();
+  
+  const child = spawn(pythonPath, [
+    "-c",
+    LOCAL_PINNED_WRITE_PYTHON,
+    params.rootPath,
+    params.relativeParentPath,
+    params.basename,
+    params.mkdir ? "1" : "0",
+    (params.mode || 0o600).toString(8),
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  // Handle spawn errors (e.g., python3 not found)
+  let spawnError: Error | null = null;
+  child.on("error", (err) => {
+    spawnError = err;
+    // If python3 is not found and we have a cached error message, use it
+    if (err.code === "ENOENT" && cachedPinnedWritePythonError) {
+      err.message = `${cachedPinnedWritePythonError}\n\nAttempted path: ${pythonPath}\nError: ${err.message}`;
+    }
+  });
 
   let stdout = "";
   let stderr = "";
@@ -189,7 +235,12 @@ export async function runPinnedWriteHelper(params: {
 
   const exitPromise = once(child, "close") as Promise<[number | null, NodeJS.Signals | null]>;
   try {
-    if (!child.stdin) {
+    // If spawn failed, try fallback
+    if (!child.stdin || spawnError) {
+      if (spawnError) {
+        // Log the error for debugging
+        console.warn("Pinned write helper spawn failed:", spawnError.message);
+      }
       const identity = await runPinnedWriteFallback(params);
       await exitPromise.catch(() => {});
       return identity;
